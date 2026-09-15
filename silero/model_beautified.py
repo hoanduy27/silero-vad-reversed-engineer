@@ -217,6 +217,112 @@ class SileroVadEncoderBlock(nn.Module):
         return x
 
 
+class BranchedEncoderBlock(nn.Module):
+    """
+    RepVGG-style re-branched version of SileroVadEncoderBlock, for fine-tuning.
+
+    We do NOT attempt to recover the original (pre-fusion) branch weights --
+    that reconstruction is lossy/non-invertible, see validate_rep_vgg.py. Instead
+    we keep the deployed 3x3 conv exactly as-is and bolt on a *new*, zero-initialized
+    1x1 branch (and, optionally, a zero-initialized identity/BN branch when
+    in_channels == out_channels and stride == 1). Because both new branches start
+    at zero contribution, `BranchedEncoderBlock.from_reparam(block)` is numerically
+    identical to the original block until training moves the new branches away
+    from zero. `reparameterize()` performs the inverse: fold the branches back into
+    a single Conv1d, algebraically equivalent to RepVGG's deploy-time fusion.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1, use_identity: bool = True):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.stride = stride
+
+        self.se = nn.Identity()
+        self.activation = nn.ReLU()
+
+        self.conv3x1 = nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1, stride=stride)
+
+        self.conv1x1 = nn.Conv1d(in_channels, out_channels, kernel_size=1, padding=0, stride=stride)
+        nn.init.zeros_(self.conv1x1.weight)
+        nn.init.zeros_(self.conv1x1.bias)
+
+        self.has_identity = use_identity and (in_channels == out_channels) and (stride == 1)
+        if self.has_identity:
+            # BatchNorm1d applied directly to the block input (RepVGG's identity
+            # branch). Zero-initialized affine weight => zero contribution at init,
+            # regardless of running statistics.
+            self.identity_bn = nn.BatchNorm1d(in_channels)
+            nn.init.zeros_(self.identity_bn.weight)
+            nn.init.zeros_(self.identity_bn.bias)
+        else:
+            self.identity_bn = None
+
+    @classmethod
+    def from_reparam(cls, block: "SileroVadEncoderBlock", use_identity: bool = True) -> "BranchedEncoderBlock":
+        """Build a branched block whose forward() output matches `block` exactly."""
+        stride = block.reparam_conv.stride[0]
+        in_channels = block.reparam_conv.in_channels
+        out_channels = block.reparam_conv.out_channels
+
+        new_block = cls(in_channels, out_channels, stride=stride, use_identity=use_identity)
+        new_block.conv3x1.weight.data.copy_(block.reparam_conv.weight.data)
+        new_block.conv3x1.bias.data.copy_(block.reparam_conv.bias.data)
+        return new_block
+
+    def forward(self, x: Tensor) -> Tensor:
+        out = self.conv3x1(x) + self.conv1x1(x)
+        if self.has_identity:
+            out = out + self.identity_bn(x)
+        out = self.se(out)
+        out = self.activation(out)
+        return out
+
+    @staticmethod
+    def _pad_1x1_to_3x1(weight_1x1: Tensor) -> Tensor:
+        # (out, in, 1) -> (out, in, 3), placing the single tap in the center
+        return F.pad(weight_1x1, [1, 1])
+
+    def _identity_to_3x1(self) -> Tuple[Tensor, Tensor]:
+        # A BatchNorm1d applied to x is equivalent, per output channel c, to a
+        # 1x1 conv with weight gamma_c / sqrt(var_c + eps) on the diagonal (c, c)
+        # and bias beta_c - mean_c * gamma_c / sqrt(var_c + eps). Padded to 3x1
+        # like the 1x1 branch, this can be summed directly into the fused kernel.
+        bn = self.identity_bn
+        std = torch.sqrt(bn.running_var + bn.eps)
+        scale = bn.weight / std
+        bias = bn.bias - bn.running_mean * scale
+
+        weight = torch.zeros(self.out_channels, self.in_channels, 1, device=scale.device, dtype=scale.dtype)
+        diag_idx = torch.arange(self.in_channels, device=scale.device)
+        weight[diag_idx, diag_idx, 0] = scale
+        return self._pad_1x1_to_3x1(weight), bias
+
+    def reparameterize(self) -> nn.Conv1d:
+        """Fold conv3x1 + conv1x1 (+ identity_bn) into a single deployable Conv1d."""
+        fused_weight = self.conv3x1.weight.data.clone()
+        fused_bias = self.conv3x1.bias.data.clone()
+
+        fused_weight = fused_weight + self._pad_1x1_to_3x1(self.conv1x1.weight.data)
+        fused_bias = fused_bias + self.conv1x1.bias.data
+
+        if self.has_identity:
+            id_weight, id_bias = self._identity_to_3x1()
+            fused_weight = fused_weight + id_weight
+            fused_bias = fused_bias + id_bias
+
+        fused_conv = nn.Conv1d(self.in_channels, self.out_channels, kernel_size=3, padding=1, stride=self.stride)
+        fused_conv.weight.data.copy_(fused_weight)
+        fused_conv.bias.data.copy_(fused_bias)
+        return fused_conv
+
+    def to_reparam_block(self) -> "SileroVadEncoderBlock":
+        """Convenience: return a plain SileroVadEncoderBlock with the fused conv."""
+        block = SileroVadEncoderBlock(self.in_channels, self.out_channels, stride=self.stride)
+        block.reparam_conv = self.reparameterize()
+        return block
+
+
 class Decoder(nn.Module):
     """
     Decoder that contains an LSTMCell-based recurrent stage and a small conv head.
