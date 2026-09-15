@@ -211,6 +211,23 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+ create mode 100644 README.md
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Reverse-engineering run outputs / generated inspection dumps
+log/
+trace.json
+*-torchscript-params.txt
+
+# Trained model checkpoints
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# speaker_sim generated data/artifacts and egs run logs
+silero/speaker_sim/data/
+silero/speaker_sim/outputs/
+egs/*/*/exp/
