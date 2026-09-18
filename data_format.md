@@ -1,0 +1,1 @@
+{"filepath": /path/to/wav, "duration_ms": 42000, "segments": [{"start_ms": 1000, "end_ms": 1200}, {"start_ms": 13000, "end_ms": 15000}]}

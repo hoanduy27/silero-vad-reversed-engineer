@@ -1,0 +1,45 @@
+# Adapter-only: base fused conv3x1 (and decoder RNN) stays frozen at its
+# checkpoint weights; only the new zero-init conv1x1 (+ identity_bn where
+# structurally eligible -- see BranchedEncoderBlock) branches train.
+model:
+  jit_checkpoint: assets/silero_vad.jit
+  use_identity: true   # currently a no-op for this checkpoint: none of the 4
+                          # real encoder blocks are structurally identity-eligible
+                          # (channel mismatch or stride=2) -- see validate_rep_vgg.py
+  freeze: [conv3x1, decoder]
+
+data:
+  manifest: exp/data/webrtc_audit/manifest.jsonl
+  val_fraction: 0.2
+
+train:
+  batch_size: 8    # real batch: utterances are duration-bucketed and padded together (see dataset.make_batches)
+  max_utterance_seconds: 60   # training only (full BPTT retains activations for backward -- a
+                                 # handful of this dataset's recordings run 5-13 minutes and will
+                                 # OOM otherwise); eval/export are unaffected (forward-only, no_grad)
+  lr: 1.0e-3
+  epochs: 30
+  seed: 0
+  device: cuda
+  primary_metric: f1   # drives BOTH "best checkpoint" selection and early stopping below.
+                          # accuracy is dominated by the majority (non-speech) class here
+                          # (~9% of frames are actual speech) and mainly useful as a
+                          # sanity-check observation -- see silero/trainer/metrics.py.
+                          # one of: loss, acc, precision, recall, f1
+  early_stopping:
+    enabled: true
+    patience: 8       # stop after this many epochs with no primary_metric improvement
+    min_delta: 0.0
+  model_averaging:
+    enabled: false      # opt-in: averages several epoch checkpoints -> exp_dir/averaged{,_fused}.pt
+    strategy: last_n      # "last_n" (most recent N epochs) or "best_k" (N best-primary_metric epochs)
+    n: 5
+
+logging:
+  tensorboard: true     # writes to <exp_dir>/tensorboard; `tensorboard --logdir <exp_dir>/tensorboard`
+  wandb:
+    enabled: false        # set true (and `wandb login`) to also log to Weights & Biases
+    project: silero-vad-adapt
+    run_name: null          # defaults to the exp_dir's name
+
+exp_dir: exp/adapter_only

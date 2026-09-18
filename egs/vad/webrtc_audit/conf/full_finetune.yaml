@@ -1,0 +1,40 @@
+# Full fine-tuning: nothing frozen -- base conv3x1, the new conv1x1/identity_bn
+# branches, and the decoder RNN all train together. Still built as a
+# BranchedEncoderBlock (not a plain fused conv) rather than skipping the
+# branching altogether: RepVGG's own ablations show the multi-branch topology
+# helps optimization even when the goal is full capacity, not just
+# parameter-efficient adaptation.
+model:
+  jit_checkpoint: assets/silero_vad.jit
+  use_identity: true   # currently a no-op for this checkpoint -- see adapter_only.yaml
+  freeze: []
+
+data:
+  manifest: exp/data/webrtc_audit/manifest.jsonl
+  val_fraction: 0.2
+
+train:
+  batch_size: 8    # real batch: utterances are duration-bucketed and padded together (see dataset.make_batches)
+  max_utterance_seconds: 60   # training only -- see adapter_only.yaml
+  lr: 1.0e-4   # lower than adapter_only.yaml: this touches the pretrained base weights directly
+  epochs: 30
+  seed: 0
+  device: cuda
+  primary_metric: f1   # see adapter_only.yaml
+  early_stopping:
+    enabled: true
+    patience: 8
+    min_delta: 0.0
+  model_averaging:
+    enabled: false
+    strategy: last_n
+    n: 5
+
+logging:
+  tensorboard: true
+  wandb:
+    enabled: false
+    project: silero-vad-adapt
+    run_name: null
+
+exp_dir: exp/full_finetune

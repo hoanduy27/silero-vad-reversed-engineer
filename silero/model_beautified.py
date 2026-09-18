@@ -15,6 +15,12 @@ class VAD(nn.Module):
     Expects these submodels to expose `.context_size_samples` and a `.forward(x, state)` signature.
     """
 
+    # Class-body type annotations -- TorchScript's scripting needs Optional[Tensor]
+    # declared this way (not inline in __init__) to type-narrow `is None` checks
+    # in forward() correctly.
+    _state: Optional[Tensor]
+    _context: Optional[Tensor]
+
     def __init__(self, sample_rates=(8000, 16000)):
         super().__init__()
         # caller should set self._model and self._model_8k after construction
@@ -43,11 +49,12 @@ class VAD(nn.Module):
         if x.dim() > 2:
             raise ValueError(f"Too many dimensions for input audio chunk {x.size()}")
 
-        # If sampling rate is multiple of 16000, downsample to 16000 by taking every `step`-th sample
-        if sr % 16000 != 0:
+        # If sampling rate is a multiple of 16000 *other than* 16000 itself
+        # (e.g. 32000), downsample to 16000 by taking every `step`-th sample.
+        # sr == 8000 (or any other non-multiple) falls through unchanged, to
+        # be checked against self.sample_rates below.
+        if sr != 16000 and sr % 16000 == 0:
             step = sr // 16000
-            if step <= 0:
-                raise ValueError(f"Unsupported sampling rate: {sr}")
             x = x[..., ::step]
             sr_effective = 16000
         else:
@@ -77,17 +84,15 @@ class VAD(nn.Module):
 
         batch_size = x.size(0)
 
-        # choose model and context size based on sampling rate
+        # context size based on sampling rate -- accessed directly per-branch
+        # (self._model.forward(...) / self._model_8k.forward(...), likewise
+        # below) rather than through a shared local variable: TorchScript
+        # can't unify a local that might statically be either submodule into
+        # one callable, even though both are structurally VADRNN.
         if sr == 16000:
-            model = self._model
-            if model is None:
-                raise RuntimeError("self._model (16k) is not set")
-            context_size = getattr(model, "context_size_samples", 0)
+            context_size = self._model.context_size_samples
         else:
-            model = self._model_8k
-            if model is None:
-                raise RuntimeError("self._model_8k (8k) is not set")
-            context_size = getattr(model, "context_size_samples", 0)
+            context_size = self._model_8k.context_size_samples
 
         # Reset streaming states if sampling rate or batch size changed
         if self._last_sr and self._last_sr != sr:
@@ -95,21 +100,34 @@ class VAD(nn.Module):
         if self._last_batch_size and self._last_batch_size != batch_size:
             self.reset_states()
 
-        # Ensure context tensor exists and is on the same device as input
-        if self._context is None or self._context.size(0) != batch_size:
+        # Ensure context tensor exists and is on the same device as input.
+        # Bound to a local first -- TorchScript doesn't reliably type-narrow
+        # `self.attr is None` followed by `self.attr.method()` in the same
+        # expression the way it does for a local variable.
+        context = self._context
+        if context is None or context.size(0) != batch_size:
             # context is (batch, context_size)
-            self._context = torch.zeros(batch_size, context_size, device=x.device, dtype=x.dtype)
+            context = torch.zeros(batch_size, context_size, device=x.device, dtype=x.dtype)
         else:
-            self._context = self._context.to(x.device)
+            context = context.to(x.device)
+        self._context = context
 
         # Concatenate context and new chunk along sample dimension
-        x_with_context = torch.cat([self._context, x], dim=1)
+        x_with_context = torch.cat([context, x], dim=1)
 
-        # Call the selected model's forward and update hidden state
+        # Call the selected model's forward and update hidden state.
+        # self._model_8k, when present, is the original (pre-scripted, never
+        # fine-tuned) checkpoint's 8kHz submodule reused as-is -- its `state`
+        # param is a plain Tensor with an empty-tensor sentinel for "none yet"
+        # (that convention, not Optional[Tensor], is what a module already
+        # compiled by torch.jit.script elsewhere requires), unlike our own
+        # VADRNN.forward's Optional[Tensor].
+        state = self._state
         if sr == 16000:
-            out, new_state = model.forward(x_with_context, self._state)
+            out, new_state = self._model.forward(x_with_context, state)
         elif sr == 8000:
-            out, new_state = model.forward(x_with_context, self._state)
+            state_8k = state if state is not None else torch.empty(0)
+            out, new_state = self._model_8k.forward(x_with_context, state_8k)
         else:
             # unreachable due to validation above
             raise ValueError(f"Unsupported sampling rate {sr}")
@@ -169,33 +187,24 @@ class STFT(nn.Module):
 
         return forward_basis
 
-    def forward(self, input_data: Tensor) -> Tuple[Tensor, Tensor]:
+    def forward(self, input_data: Tensor) -> Tensor:
         """
         input_data: (batch, samples)
-        returns: (magnitude, phase) where both are (batch, freq_bins, frames)
+        returns: magnitude, shape (batch, freq_bins, frames)
         """
         # pad and add channel dim for conv1d: shape (batch, 1, samples_padded)
         x = input_data
         x = self.padding(x)
         x = x.unsqueeze(1)
 
-        if self.forward_basis_buffer is None:
-            raise RuntimeError("forward_basis_buffer is not set on STFT")
-
         # conv1d expects weight shape (out_channels, in_channels, kernel_size)
         conv = F.conv1d(x, self.forward_basis_buffer, bias=None, stride=self.hop_length, padding=0)
 
         cutoff = (self.filter_length // 2) + 1  # number of frequency bins
-        # assume conv produces channels = 2 * cutoff (real then imag)
-        if conv.size(1) < 2 * cutoff:
-            raise RuntimeError("forward transform produced too few channels for split into real/imag parts")
-
         real = conv[:, :cutoff, :]
-        imag = conv[:, cutoff:cutoff*2, :]
+        imag = conv[:, cutoff:cutoff * 2, :]
 
         magnitude = torch.sqrt(real.pow(2) + imag.pow(2) + 1e-12)
-        phase = torch.atan2(imag, real)
-
         return magnitude
 
 
@@ -455,5 +464,57 @@ class VADRNN(nn.Module):
         embedding = encoded.mean(dim=2)  # (batch, 128)
 
         return embedding
+
+    def forward_sequence(self, x: Tensor) -> Tensor:
+        """
+        Full-utterance training forward: reproduces VAD.forward's per-chunk
+        computation exactly (each 512-sample chunk gets context_size_samples=64
+        raw-sample look-back prepended, LSTM state carried across chunks) --
+        unlike naively running STFT + encoder once over the whole continuous
+        signal, which does NOT reproduce the same per-frame decisions: each
+        streaming chunk's STFT window is anchored context_size_samples (64 =
+        half a hop_length) earlier than a global, whole-signal frame grid would
+        place it, and its trailing reflection-padding reflects that chunk's own
+        tail rather than the signal's true continuation.
+
+        Unlike a literal per-chunk port, though, the STFT+encoder half of this
+        (unlike the decoder) has no recurrence -- each chunk's window is fully
+        determined by raw audio, independent of any other chunk's decision --
+        so all chunks' windows are built and run through STFT+encoder as ONE
+        batched call via `unfold` instead of a Python loop over tiny per-chunk
+        conv calls, which is what actually keeps the GPU busy; only the
+        decoder's LSTMCell, which is inherently sequential, still loops.
+
+        x: (batch, samples) or (samples,)
+        Returns: (batch, num_chunks) speech probabilities, one per 512-sample
+        chunk (matching the streaming `num_samples=512` convention for 16kHz).
+        """
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+
+        chunk_size = 512
+        batch = x.size(0)
+        num_chunks = x.size(1) // chunk_size
+
+        leading_zeros = torch.zeros(batch, self.context_size_samples, device=x.device, dtype=x.dtype)
+        padded = torch.cat([leading_zeros, x[:, :num_chunks * chunk_size]], dim=1)
+        # windows[:, i, :] == cat([context_for_chunk_i, chunk_i]), exactly what
+        # the per-chunk loop would build (context_for_chunk_0 is the leading
+        # zeros; context_for_chunk_i>0 is chunk_{i-1}'s trailing context_size_samples).
+        windows = padded.unfold(1, self.context_size_samples + chunk_size, chunk_size)  # (batch, num_chunks, ctx+chunk)
+
+        windows_flat = windows.reshape(batch * num_chunks, -1)
+        magnitude = self.stft(windows_flat)
+        encoded = self.encoder(magnitude)  # (batch*num_chunks, 128, 1) -- one frame/window
+        encoded = encoded.reshape(batch, num_chunks, -1)  # (batch, num_chunks, 128)
+
+        state = None
+        outs = []
+        for i in range(num_chunks):
+            frame = encoded[:, i, :].unsqueeze(-1)  # (batch, 128, 1)
+            out, state = self.decoder(frame, state)  # out: (batch, 1, 1)
+            outs.append(out.squeeze(-1).squeeze(-1))  # (batch,)
+
+        return torch.stack(outs, dim=1)  # (batch, num_chunks)
 
 
