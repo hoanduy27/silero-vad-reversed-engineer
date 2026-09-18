@@ -1,5 +1,5 @@
 import torch
-from silero.model import VAD, VADRNN
+from silero.model_beautified import VAD, VADRNN
 from collections import OrderedDict
 
 state_dict = OrderedDict()
@@ -10,8 +10,10 @@ class Validator:
         self.vad._model = VADRNN()
 
         self.loaded = torch.jit.load("assets/silero_vad.jit")
-            
-        self.vad._model.load_state_dict(self.loaded._model.state_dict())
+
+        loaded_state_dict = self.loaded._model.state_dict()
+        loaded_state_dict.pop("stft.forward_basis_buffer")
+        self.vad._model.load_state_dict(loaded_state_dict, strict=False)
 
         self.loaded._model.eval()
         self.vad._model.eval()

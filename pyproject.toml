@@ -1,0 +1,26 @@
+[project]
+name = "silero-reverse-engineer"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "librosa>=1.0.0",
+    "matplotlib>=3.11.2",
+    "pytest>=9.1.1",
+    "pyyaml>=6.0.3",
+    "requests>=2.34.2",
+    "scikit-learn>=1.9.1",
+    "scipy>=1.18.1",
+    "soundfile>=0.14.0",
+    "tensorboard>=2.21.0",
+    "torch>=2.14.0",
+]
+
+[project.optional-dependencies]
+wandb = [
+    "wandb>=0.30.0",
+]
+dev = [
+    "silero-vad>=6.2.1",
+]
